@@ -15,13 +15,18 @@ Column types are detected from the values rather than the header, with one delib
 headers that name a label rather than a measurement (id, phone, anything ending _no or _code) stay
 as text. Storing a phone number as a number eats the leading plus, and summing an id means nothing.
 
+Dates written 03/04/2026 are ambiguous. Each date column is read as a whole: if any value in it can
+only be day first (a day above 12) the column is day first, if any can only be month first it is
+month first, and if the column contradicts itself it is left as text and reported. A column that
+never settles the question is read day first unless you pass --month-first.
+
 Tabs produced:
   Analysis   headline tiles, one breakdown block per usable text column, native Excel charts
   Data       the rows as the SourceData table, which is where new data is pasted
   Read me    where to paste, how it refreshes, and how to add a pivot table and a slicer
 
 Usage:
-  python build_analysis_workbook.py <input.csv> [output.xlsx]
+  python build_analysis_workbook.py <input.csv> [output.xlsx] [--month-first]
 
 Requires openpyxl. Tests: python tests/test_build_analysis_workbook.py
 """
@@ -48,7 +53,14 @@ grey_fill = PatternFill("solid", fgColor=GREY)
 thin = Side(style="thin", color="BFBFBF")
 box = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-DATE_PATTERNS = ("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%Y/%m/%d", "%d-%m-%Y")
+# Four digit years only. A compact 20260403 or a two digit 03/04/26 is not worth the false
+# positives: a postcode 012345 and a version 1.2.30 both parse as dates under those patterns.
+YEAR_FIRST_PATTERNS = ("%Y-%m-%d", "%Y/%m/%d")
+DAY_FIRST_PATTERNS = ("%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y")
+MONTH_FIRST_PATTERNS = ("%m/%d/%Y", "%m-%d-%Y", "%m.%d.%Y")
+# Characters Excel requires escaping with a single quote inside a structured reference such as
+# SourceData[amount ($)]. Taken from Microsoft's list for table column specifiers.
+STRUCTURED_REF_SPECIALS = re.compile(r"([\t\n\r,:.\[\]#'\"{}$^&*+=\-<>/])")
 # Columns that look numeric but are labels. Storing these as numbers loses the leading plus of a
 # phone number and the leading zero of a postcode, and summing them means nothing.
 # Matched against the whole header, not against any word inside it: "last_order_amount" is money,
@@ -59,10 +71,11 @@ LABEL_HEADERS = re.compile(
     r"|_(id|no|num|number|code|ref)$"
     r"|^(phone|mobile|tel|fax|zip|postal|account|invoice|order)_", re.I)
 MAX_BREAKDOWNS = 3          # breakdown blocks on the Analysis tab
-MAX_CATEGORIES = 12         # rows per breakdown block
+MAX_CATEGORIES = 12         # rows per breakdown block, plus one Other row
 
 
-def as_date(value):
+def as_date(value, order="dmy"):
+    """Parse one cell as a date. `order` settles 03/04/2026: "dmy" is 3 April, "mdy" is 4 March."""
     try:
         text = value.strip()
     except AttributeError:
@@ -73,7 +86,8 @@ def as_date(value):
         return datetime.fromisoformat(text.replace("Z", "+00:00")).date()
     except ValueError:
         pass
-    for pattern in DATE_PATTERNS:
+    ordered = DAY_FIRST_PATTERNS if order == "dmy" else MONTH_FIRST_PATTERNS
+    for pattern in YEAR_FIRST_PATTERNS + ordered:
         try:
             return datetime.strptime(text, pattern).date()
         except ValueError:
@@ -81,21 +95,71 @@ def as_date(value):
     return None
 
 
+def date_order(values, default="dmy"):
+    """Decide, for a whole column, whether 03/04/2026 means 3 April or 4 March.
+
+    Returns "dmy", "mdy", or "mixed" when the column contains values that can only be one and
+    values that can only be the other. A mixed column is not a date column: reading it either way
+    would silently put some rows in the wrong month.
+    """
+    only_dmy = only_mdy = 0
+    for v in values:
+        d, m = as_date(v, "dmy"), as_date(v, "mdy")
+        if d and not m:
+            only_dmy += 1
+        elif m and not d:
+            only_mdy += 1
+    if only_dmy and only_mdy:
+        return "mixed"
+    if only_dmy:
+        return "dmy"
+    if only_mdy:
+        return "mdy"
+    return default
+
+
 def as_number(value):
+    """Read a number the way a person would: 1,234.50 and 1 000 and $99 and (120.00) and 12 USD.
+
+    A percent sign is left alone on purpose. Turning "12%" into 12 changes its meaning, so such a
+    column stays text rather than being quietly wrong by a factor of a hundred.
+    """
     if value is None:
         return None
-    text = str(value).strip().replace(",", "")
-    text = re.sub(r"^[^\d\-.]+", "", text)      # currency symbols and the like
+    text = str(value).strip()
+    if not text or "%" in text:
+        return None
+    negative = text.startswith("(") and text.endswith(")")
+    if negative:
+        text = text[1:-1]
+    # A currency symbol, or a code of up to three letters set off by a space, on either side.
+    # Letters glued to the digits are left alone: SKU123 and A100 are codes, not 123 and 100.
+    text = re.sub(r"^(-?)(?:[A-Za-z]{1,3}\s+|[^\w\s.\-]+\s*)", r"\1", text)
+    text = re.sub(r"(?:\s+[A-Za-z]{1,3}|\s*[^\w\s.\-]+)$", "", text)
+    text = re.sub(r"[\s,]", "", text)             # thousands separators, either style
     if text in ("", "-", "."):
         return None
     try:
-        return float(text)
+        number = float(text)
     except ValueError:
         return None
+    return -number if negative else number
 
 
-def sniff(rows, header):
-    """Decide what each column is, from the values rather than from the header name."""
+def looks_like_a_label(value):
+    """A leading plus or a leading zero that must survive: +230..., 01234. Not 0.85, and not a date,
+    which is checked before this ever runs."""
+    text = str(value).strip()
+    return len(text) > 5 and re.match(r"^(\+|0\d)", text) is not None
+
+
+def sniff(rows, header, default_order="dmy"):
+    """Decide what each column is, from the values rather than from the header name.
+
+    Order matters. Dates are tested before the leading-zero rule, because 03/04/2026 starts with a
+    zero and is still a date. Labels are tested before numbers, because 01234 parses as a number and
+    is still a postcode.
+    """
     kinds = []
     for i, name in enumerate(header):
         values = [r[i] for r in rows if i < len(r) and str(r[i]).strip() != ""]
@@ -105,34 +169,42 @@ def sniff(rows, header):
         if LABEL_HEADERS.search(str(name)):
             kinds.append("text")
             continue
-        keeps_shape = sum(1 for v in values
-                          if str(v).strip().startswith(("+", "0")) and len(str(v).strip()) > 5)
-        if keeps_shape >= 0.3 * len(values):    # a plus or a leading zero that must survive
-            kinds.append("text")
-            continue
-        dates = sum(1 for v in values if as_date(v) is not None)
-        numbers = sum(1 for v in values if as_number(v) is not None)
+        order = date_order(values, default_order)
+        dates = 0 if order == "mixed" else sum(1 for v in values if as_date(v, order) is not None)
         if dates >= 0.8 * len(values):
             kinds.append("date")
-        elif numbers >= 0.8 * len(values):
-            kinds.append("number")
-        else:
+            continue
+        if sum(1 for v in values if looks_like_a_label(v)) >= 0.3 * len(values):
             kinds.append("text")
+            continue
+        numbers = sum(1 for v in values if as_number(v) is not None)
+        kinds.append("number" if numbers >= 0.8 * len(values) else "text")
     return kinds
 
 
-def safe_name(name, used):
-    """Excel table and defined names cannot contain spaces or most punctuation."""
-    clean = re.sub(r"\W+", "_", str(name)).strip("_") or "column"
-    if clean[0].isdigit():
-        clean = "c_" + clean
-    while clean.lower() in used:
-        clean += "_x"
-    used.add(clean.lower())
-    return clean
+def clean_headers(header):
+    """Headers become Excel Table column names, which must be unique and are better without line
+    breaks. Returns the cleaned list and a note for every header that had to change."""
+    out, notes, seen = [], [], set()
+    for i, raw in enumerate(header, 1):
+        name = re.sub(r"\s+", " ", str(raw)).strip() or f"column_{i}"
+        base, n = name, 2
+        while name.lower() in seen:
+            name = f"{base}_{n}"
+            n += 1
+        if name != str(raw):
+            notes.append(f"header {i} {raw!r} written as {name!r}")
+        seen.add(name.lower())
+        out.append(name)
+    return out, notes
 
 
-def build(csv_path, out_path):
+def col(name):
+    """A column reference inside the SourceData table, escaped the way Excel requires."""
+    return "SourceData[" + STRUCTURED_REF_SPECIALS.sub(r"'\1", name) + "]"
+
+
+def build(csv_path, out_path, month_first=False):
     with open(csv_path, newline="", encoding="utf-8-sig", errors="replace") as fh:
         reader = csv.reader(fh)
         header = next(reader)
@@ -140,10 +212,19 @@ def build(csv_path, out_path):
     if not rows:
         raise SystemExit(f"{csv_path} has a header but no data rows")
 
-    header = [h.strip() or f"column_{i}" for i, h in enumerate(header, 1)]
+    header, notes = clean_headers(header)
     width = len(header)
     rows = [(r + [""] * width)[:width] for r in rows]
-    kinds = sniff(rows, header)
+    default_order = "mdy" if month_first else "dmy"
+    kinds = sniff(rows, header, default_order)
+    orders = {}
+    for i, (name, kind) in enumerate(zip(header, kinds)):
+        values = [r[i] for r in rows if str(r[i]).strip()]
+        order = date_order(values, default_order)
+        if order == "mixed":
+            notes.append(f"column {name!r} mixes day-first and month-first dates, left as text")
+        elif kind == "date":
+            orders[name] = order
 
     wb = Workbook()
 
@@ -153,9 +234,9 @@ def build(csv_path, out_path):
     data_ws.append(header)
     for raw in rows:
         out = []
-        for value, kind in zip(raw, kinds):
+        for value, kind, name in zip(raw, kinds, header):
             if kind == "date":
-                out.append(as_date(value) or value)
+                out.append(as_date(value, orders[name]) or value)
             elif kind == "number":
                 number = as_number(value)
                 out.append(value if number is None else number)
@@ -189,16 +270,19 @@ def build(csv_path, out_path):
     line = 4
     ws.cell(line, 1, "Headline numbers").font = bold
     line += 1
-    first_text = next((header[i] for i, k in enumerate(kinds) if k == "text"), header[0])
-    tiles = [("Rows of data", f"=SUBTOTAL(103,SourceData[{first_text}])", "#,##0")]
+    # ROWS of a table column counts every row in the table, blank cells included. A COUNTA here
+    # would silently undercount the moment one row had an empty cell in that column.
+    tiles = [("Rows of data", f"=ROWS({col(header[0])})", "#,##0")]
+    # Date tiles first, so the cap below never drops "Latest", which is the one people look at.
+    for name, kind in zip(header, kinds):
+        if kind == "date":
+            tiles.append((f"Earliest {name}", f"=IFERROR(MIN({col(name)}),0)", "yyyy-mm-dd"))
+            tiles.append((f"Latest {name}", f"=IFERROR(MAX({col(name)}),0)", "yyyy-mm-dd"))
     for name, kind in zip(header, kinds):
         if kind == "number":
-            tiles.append((f"Total {name}", f"=SUM(SourceData[{name}])", "#,##0.00"))
-            tiles.append((f"Average {name}", f"=IFERROR(AVERAGE(SourceData[{name}]),0)", "#,##0.00"))
-        elif kind == "date":
-            tiles.append((f"Earliest {name}", f"=IFERROR(MIN(SourceData[{name}]),0)", "yyyy-mm-dd"))
-            tiles.append((f"Latest {name}", f"=IFERROR(MAX(SourceData[{name}]),0)", "yyyy-mm-dd"))
-    for label, formula, fmt in tiles[:8]:
+            tiles.append((f"Total {name}", f"=SUM({col(name)})", "#,##0.00"))
+            tiles.append((f"Average {name}", f"=IFERROR(AVERAGE({col(name)}),0)", "#,##0.00"))
+    for label, formula, fmt in tiles[:9]:
         ws.cell(line, 1, label).border = box
         ws.cell(line, 1).fill = light_fill
         cell = ws.cell(line, 2, formula)
@@ -232,14 +316,27 @@ def build(csv_path, out_path):
             ws.cell(line, 3).fill = navy_fill
         line += 1
         labels = [v for v, _ in counts.most_common(MAX_CATEGORIES)]
+        first = line
         for value in labels:
             ws.cell(line, 1, value).border = box
-            count = ws.cell(line, 2, f'=COUNTIF(SourceData[{name}],$A{line})')
+            # Not COUNTIF. COUNTIF reads a category called ">65" or "<18" as a comparison and
+            # returns 0 for it, and treats * and ? as wildcards. This compares the text exactly.
+            count = ws.cell(line, 2, f"=SUMPRODUCT(--({col(name)}=$A{line}))")
             count.border, count.number_format = box, "#,##0"
             if measure:
-                total = ws.cell(line, 3, f'=SUMIF(SourceData[{name}],$A{line},SourceData[{measure}])')
+                total = ws.cell(line, 3, f"=SUMPRODUCT(--({col(name)}=$A{line}),{col(measure)})")
                 total.border, total.number_format = box, "#,##0.00"
             line += 1
+        # Everything not listed above: categories beyond the first twelve, blank cells, and any
+        # new category pasted in later. This is what makes the block always add up to the headline.
+        ws.cell(line, 1, "Other").border = box
+        ws.cell(line, 1).font = Font(italic=True)
+        other = ws.cell(line, 2, f"=ROWS({col(name)})-SUM(B{first}:B{line - 1})")
+        other.border, other.number_format = box, "#,##0"
+        if measure:
+            other_total = ws.cell(line, 3, f"=SUM({col(measure)})-SUM(C{first}:C{line - 1})")
+            other_total.border, other_total.number_format = box, "#,##0.00"
+        line += 1
         chart_anchors.append((name, head_row, line - 1, bool(measure)))
         line += 2
 
@@ -247,8 +344,8 @@ def build(csv_path, out_path):
         chart = BarChart() if index == 0 else LineChart()
         chart.title = f"{'Total ' + measure if has_measure else 'Rows'} by {name}"
         chart.height, chart.width = 7.5, 15
-        col = 3 if has_measure else 2
-        values = Reference(ws, min_col=col, min_row=head_row, max_row=last_row)
+        value_col = 3 if has_measure else 2
+        values = Reference(ws, min_col=value_col, min_row=head_row, max_row=last_row)
         cats = Reference(ws, min_col=1, min_row=head_row + 1, max_row=last_row)
         chart.add_data(values, titles_from_data=True)
         chart.set_categories(cats)
@@ -260,9 +357,9 @@ def build(csv_path, out_path):
     ws.column_dimensions["C"].width = 20
 
     # ---- Read me tab ----------------------------------------------------------------------------
-    notes = wb.create_sheet("Read me")
-    notes["A1"] = "How this workbook works"
-    notes["A1"].font = title_font
+    readme = wb.create_sheet("Read me")
+    readme["A1"] = "How this workbook works"
+    readme["A1"].font = title_font
     text = [
         ("Where to paste new data", ""),
         ("", "Go to the Data tab. Click cell A2. Paste your rows there. Keep the header row as it is."),
@@ -294,28 +391,38 @@ def build(csv_path, out_path):
         ("", "Dates and numbers are detected from the values, not from the column name. If a column "
              "arrives as text, select it on the Data tab and set the format, then the tiles that use "
              "it will start calculating."),
+        ("", "A date like 03/04/2026 was read day first, as 3 April, unless the column itself proved "
+             "it was month first. If your file is month first, rebuild with --month-first."),
+        ("", ""),
+        ("The Other row in each breakdown", ""),
+        ("", "A breakdown lists the categories that existed when the workbook was built, up to twelve. "
+             "Other is everything else: further categories, blank cells, and any new category you "
+             "paste in later. That is why each block always adds up to the Rows of data figure."),
     ]
     row = 3
     for heading, body in text:
         if heading:
-            notes.cell(row, 1, heading).font = bold
-            notes.cell(row, 1).fill = grey_fill
+            readme.cell(row, 1, heading).font = bold
+            readme.cell(row, 1).fill = grey_fill
         if body:
-            cell = notes.cell(row, 1, body)
+            cell = readme.cell(row, 1, body)
             cell.alignment = Alignment(wrap_text=True, vertical="top")
         row += 1
-    notes.column_dimensions["A"].width = 110
+    readme.column_dimensions["A"].width = 110
 
     wb.save(out_path)
-    return out_path, len(rows), header, kinds, [c[1] for c in candidates[:MAX_BREAKDOWNS]]
+    return out_path, len(rows), header, kinds, [c[1] for c in candidates[:MAX_BREAKDOWNS]], notes
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    if not args:
         raise SystemExit(__doc__.strip().splitlines()[-3])
-    source = pathlib.Path(sys.argv[1])
-    target = pathlib.Path(sys.argv[2]) if len(sys.argv) > 2 else source.with_suffix(".analysis.xlsx")
-    path, n, header, kinds, blocks = build(source, target)
+    source = pathlib.Path(args[0])
+    target = pathlib.Path(args[1]) if len(args) > 1 else source.with_suffix(".analysis.xlsx")
+    path, n, header, kinds, blocks, notes = build(source, target, month_first="--month-first" in sys.argv)
     print(f"{path}: {n} rows, {len(header)} columns")
     print("  types     :", ", ".join(f"{h}={k}" for h, k in zip(header, kinds)))
     print("  breakdowns:", ", ".join(blocks) or "none")
+    for note in notes:
+        print("  note      :", note)

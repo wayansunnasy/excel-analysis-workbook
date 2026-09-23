@@ -5,6 +5,7 @@ updates itself. No macros, no add-ins, and it behaves the same on Windows and ma
 
 ```
 python build_analysis_workbook.py sales.csv
+python build_analysis_workbook.py sales.csv --month-first
 ```
 
 ## The problem it solves
@@ -18,7 +19,7 @@ every tile, breakdown and chart refers to it by name:
 
 ```
 =SUM(SourceData[amount])
-=COUNTIF(SourceData[country],$A12)
+=SUMPRODUCT(--(SourceData[country]=$A12))
 ```
 
 An Excel Table grows and shrinks with whatever you paste, so the formulas follow the data instead
@@ -26,18 +27,28 @@ of pointing at dead cells.
 
 ## Proof that it actually follows the data
 
-Built from a 735 row file, then recalculated with LibreOffice:
+Built from the 500 row file in `examples/`, recalculated with LibreOffice, then 50 rows were pasted
+under the table and it was recalculated again. The pasted rows carried a price of 100.00, a stock
+count of 1, a date of 2026-09-23 and a category that did not exist before.
 
-| Figure | 735 rows | After pasting 50 more |
+| Figure | 500 rows | After pasting 50 more |
 |---|---|---|
-| Rows of data | 735 | 785 |
-| Total amount | 336,731.99 | 341,731.99 |
-| Latest date | 2025-08-22 | 2026-01-15 |
-| Rows where status is active | 366 | 416 |
+| Rows of data | 500 | 550 |
+| Total price | 17,520.20 | 22,520.20 |
+| Total stock_count | 6,833 | 6,883 |
+| Latest scraped_at_utc | 2026-09-17 | 2026-09-23 |
+| Category breakdown, Other row | 131 | 181 |
 
-Not one formula was edited between those two columns. The 50 added rows carried 100.00 each, and
-the total rose by exactly 5,000.00. The breakdowns also reconcile to the headline: 366 + 242 + 127
-equals the 735 row count.
+Not one formula was edited between those two columns. The total rose by exactly 5,000.00, the
+stock count by exactly 50, and the 50 rows of the new category landed in the breakdown's `Other`
+row, so the block still adds up to the headline. It did both times: the twelve category rows plus
+`Other` sum to 500 before and 550 after. No formula returned an error in either run.
+
+The whole thing is one command if you have LibreOffice installed:
+
+```
+python tests/paste_proof.py
+```
 
 ## What you get
 
@@ -49,6 +60,10 @@ Three tabs.
 - `Read me` where to paste, how it refreshes, why there are no macros, and the five steps to add
   a pivot table and a slicer.
 
+Every breakdown ends with an `Other` row. It holds the categories beyond the first twelve, blank
+cells, and anything new you paste in later, which is what keeps each block adding up to the row
+count instead of quietly drifting away from it.
+
 ## Column types are read from the values, not the header
 
 With one deliberate exception. A header that names a label rather than a measurement stays as
@@ -59,7 +74,22 @@ Storing a phone number as a number eats the leading plus. Summing an id means no
 single most common way a "cleaned" spreadsheet arrives quietly broken.
 
 Note that `last_order_amount` is money and `order_no` is a label, so the match is against the
-whole header rather than any word inside it. There is a test for exactly that.
+whole header rather than any word inside it. There is a test for exactly that. Letters glued to
+digits are codes too: `SKU123` is not 123.
+
+Numbers are read the way a person reads them: `1,234.50`, `1 000`, `$99`, `12 USD` and
+`(1,200.00)` are all numbers. `12%` is left as text on purpose, because reading it as 12 would
+be wrong by a factor of a hundred.
+
+**Dates.** `03/04/2026` is ambiguous. Each date column is decided once, as a whole: if any value in
+it can only be day first, such as `25/12/2026`, the column is day first; if any can only be month
+first, the column is month first; and if it contains both, it is left as text and the build says
+so, because reading it either way would put some rows in the wrong month. A column that never
+settles the question is read day first unless you pass `--month-first`.
+
+**Headers.** Two columns with the same name would make Excel strip the table on open, so the
+second becomes `name_2` and the build tells you. Characters that Excel needs escaped inside a
+table reference, such as `$`, `-` and `.`, are escaped.
 
 ## What it does not do
 
@@ -76,12 +106,24 @@ behaviour on Windows and macOS, and label columns never coerced to numbers. Each
 The implementation was then produced with an AI-assisted workflow and held to those tests rather
 than to an opinion about whether it looked right.
 
-Nothing was published until all seven tests passed and a LibreOffice recalculation confirmed the
-table in the section above: 50 rows added, every figure moved, no formula edited.
+The first version passed its seven tests and a LibreOffice recalculation, and was published. A
+separate adversarial pass two days later, run against the published code with hostile input rather
+than friendly input, found eight defects the friendly tests had not reached:
 
-That order is the point. The interesting part of building software this way is not the generation,
-it is deciding what "correct" means before anything is generated, and then refusing to ship until
-it is demonstrated.
+- a padded date such as `03/04/2026` was classed as a label because it starts with a zero, so the
+  column lost its date tiles without a word
+- each cell in a date column was read on its own, so `03/04/2026` and `12/25/2026` in the same
+  column landed in different months
+- `SKU123` was read as the number 123 and summed
+- a category called `>65` or `<18` counted as zero, because `COUNTIF` reads it as a comparison
+- the row count counted the non-empty cells of the first text column, so one blank cell undercounted it
+- two columns with the same header produced a table Excel would strip on open
+- a header such as `amount ($)` produced a reference Excel cannot parse
+- a thirteenth category, or a new one pasted in later, vanished from the breakdown
+
+Every one of them is now a test, and the fixes are in this version. That is the part of the method
+worth copying: the friendly tests prove the design, the hostile pass proves the code, and nothing
+is called finished until both have been run.
 
 ## Install and test
 
@@ -90,7 +132,7 @@ pip install openpyxl
 python tests/test_build_analysis_workbook.py
 ```
 
-Seven tests, no pytest required. The strongest one asserts that every formula written to the
+Eighteen tests, no pytest required. The strongest one asserts that every formula written to the
 Analysis tab goes through `SourceData[...]`, so a fixed range can never creep back in.
 
 ## Licence
